@@ -8,6 +8,7 @@
   body{font-family:system-ui,Inter,Segoe UI,Arial;background:#0f1115;color:#e7e9ee;margin:2rem}
   .card{max-width:860px;margin:auto;background:#171a21;padding:16px;border-radius:14px}
   button{padding:.6rem 1rem;border:0;border-radius:10px;cursor:pointer;margin-right:.5rem}
+  #dbg{margin-top:12px;font-family:ui-monospace,Consolas,monospace;font-size:12px;color:#f7bfbf}
 </style>
 </head>
 <body>
@@ -19,51 +20,81 @@
     <button id="on">LED ON</button>
     <button id="off">LED OFF</button>
   </p>
+  <div id="dbg"></div>
 </div>
+
+<!-- Chart.js global (UMD) -->
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
 
 <script type="module">
 import { createClient } from "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm";
+
 const SUPABASE_URL = "https://rhueaecnicoclhbemdjy.supabase.co";
 const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJodWVhZWNuaWNvY2xoYmVtZGp5Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTc2NDc0NzAsImV4cCI6MjA3MzIyMzQ3MH0.BEGVkEaAb6xyyShn0tS4xmG4dGhbCVZatIrSR56lfCA";
 const DEVICE_ID = "rbpi-zero2w-1";
-const sb = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
-// Chart
-const { Chart } = await import("https://cdn.jsdelivr.net/npm/chart.js@4.4.4/+esm");
+const sb = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+const $val = document.getElementById('val');
+const $dbg = document.getElementById('dbg');
+
+// --- Chart
 const labels=[], data=[];
 const chart = new Chart(document.getElementById('chart'), {
   type:'line',
   data:{ labels, datasets:[{ label:'distance (cm)', data, tension:.25 }]},
   options:{ animation:false, scales:{ y:{ beginAtZero:true } } }
 });
-const $val = document.getElementById('val');
+
+function dbg(...args){ console.log(...args); $dbg.textContent = (args.map(a=>typeof a==='string'?a:JSON.stringify(a)).join(' | ')); }
 
 // Carga inicial (últimos 60)
-const { data: init } = await sb.from('sensor_readings')
-  .select('*').eq('device_id', DEVICE_ID)
-  .order('ts', { ascending:false }).limit(60);
-(init??[]).reverse().forEach(r=>{
-  labels.push(new Date(r.ts).toLocaleTimeString()); data.push(Number(r.value));
-});
-chart.update();
+try {
+  const { data: init, error } = await sb
+    .from('sensor_readings')
+    .select('ts,value,device_id')
+    .eq('device_id', DEVICE_ID)
+    .order('ts', { ascending:false })
+    .limit(60);
 
-// Realtime
-sb.channel('readings')
- .on('postgres_changes', { event:'INSERT', schema:'public', table:'sensor_readings',
-   filter:`device_id=eq.${DEVICE_ID}` },
-   payload=>{
-     const r = payload.new, v = Number(r.value);
-     labels.push(new Date(r.ts).toLocaleTimeString());
-     data.push(v);
-     if(labels.length>120){ labels.shift(); data.shift(); }
-     $val.textContent = v.toFixed(1);
-     chart.update();
-   }
- ).subscribe();
+  if (error) { dbg('SELECT error:', error); }
+  else {
+    (init ?? []).reverse().forEach(r=>{
+      labels.push(new Date(r.ts).toLocaleTimeString());
+      data.push(Number(r.value));
+    });
+    if ((init ?? []).length) {
+      $val.textContent = Number(init[0].value).toFixed(1);
+      chart.update();
+    } else {
+      dbg('No hay datos iniciales para', DEVICE_ID);
+    }
+  }
+} catch (e) { dbg('SELECT catch:', e); }
 
-// Comandos LED
-document.getElementById('on').onclick  = ()=> sb.from('commands').insert({ device_id: DEVICE_ID, command:'LED_ON' });
-document.getElementById('off').onclick = ()=> sb.from('commands').insert({ device_id: DEVICE_ID, command:'LED_OFF' });
+// Realtime (INSERT)
+try {
+  const channel = sb.channel('readings')
+    .on('postgres_changes', { event:'INSERT', schema:'public', table:'sensor_readings', filter:`device_id=eq.${DEVICE_ID}` },
+      payload=>{
+        const r = payload.new, v = Number(r.value);
+        labels.push(new Date(r.ts).toLocaleTimeString());
+        data.push(v);
+        if(labels.length>120){ labels.shift(); data.shift(); }
+        $val.textContent = v.toFixed(1);
+        chart.update();
+      })
+    .subscribe(status => dbg('Realtime status:', status));
+} catch (e) { dbg('Realtime catch:', e); }
+
+// Comandos LED con feedback
+document.getElementById('on').onclick  = async () => {
+  const { error } = await sb.from('commands').insert({ device_id: DEVICE_ID, command:'LED_ON' });
+  if (error) dbg('LED_ON error:', error);
+};
+document.getElementById('off').onclick = async () => {
+  const { error } = await sb.from('commands').insert({ device_id: DEVICE_ID, command:'LED_OFF' });
+  if (error) dbg('LED_OFF error:', error);
+};
 </script>
 </body>
 </html>
