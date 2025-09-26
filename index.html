@@ -3,98 +3,118 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>RPi Zero 2W – Distancia en tiempo real</title>
+<title>RPi Zero 2W – I²C: Sensores + OLED</title>
 <style>
   body{font-family:system-ui,Inter,Segoe UI,Arial;background:#0f1115;color:#e7e9ee;margin:2rem}
-  .card{max-width:860px;margin:auto;background:#171a21;padding:16px;border-radius:14px}
+  .card{max-width:920px;margin:auto;background:#171a21;padding:16px;border-radius:14px}
   button{padding:.6rem 1rem;border:0;border-radius:10px;cursor:pointer;margin-right:.5rem}
+  .tabs{display:flex;gap:.5rem;margin-bottom:10px}
+  .tab{background:#232836} .tab.active{background:#2d3345}
+  .row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
   #dbg{margin-top:12px;font-family:ui-monospace,Consolas,monospace;font-size:12px;color:#f7bfbf}
+  .hidden{display:none}
+  textarea{width:100%;min-height:90px;border-radius:8px;border:0;padding:.6rem;background:#0f1115;color:#e7e9ee}
+  select{padding:.4rem;border-radius:8px;border:0;background:#0f1115;color:#e7e9ee}
 </style>
 </head>
 <body>
 <div class="card">
-  <h1>HC-SR04 (cm) en tiempo real</h1>
-  <p><strong>Distancia:</strong> <span id="val">—</span> cm</p>
-  <canvas id="chart" height="140"></canvas>
-  <p>
-    <button id="on">LED ON</button>
-    <button id="off">LED OFF</button>
-  </p>
+  <h1>Sensores I²C en tiempo real + Control OLED</h1>
+
+  <div class="tabs">
+    <button id="tabSensors" class="tab active">Sensores</button>
+    <button id="tabOled" class="tab">OLED</button>
+  </div>
+
+  <!-- Sensores -->
+  <div id="panelSensors">
+    <div class="row">
+      <label><strong>Métrica:</strong>
+        <select id="metric">
+          <option value="temp_c">Temperatura (°C)</option>
+          <option value="humidity_pct">Humedad (%)</option>
+          <option value="pressure_hpa">Presión (hPa)</option>
+          <option value="gyro_x_dps">Giro X (dps)</option>
+          <option value="gyro_y_dps">Giro Y (dps)</option>
+          <option value="gyro_z_dps">Giro Z (dps)</option>
+        </select>
+      </label>
+      <span><strong>Valor:</strong> <span id="val">—</span></span>
+    </div>
+    <canvas id="chart" height="160"></canvas>
+  </div>
+
+  <!-- OLED -->
+  <div id="panelOled" class="hidden">
+    <p>Mensaje a la pantalla (se muestra ~10 s):</p>
+    <textarea id="msg" placeholder="Hola desde la web ✨"></textarea>
+    <p>
+      <button id="sendMsg">Enviar al OLED</button>
+      <button id="clearOled">Limpiar OLED</button>
+    </p>
+  </div>
+
   <div id="dbg"></div>
 </div>
 
-<!-- Chart.js global (UMD) -->
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
-
 <script type="module">
 import { createClient } from "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm";
-
 const SUPABASE_URL = "https://rhueaecnicoclhbemdjy.supabase.co";
 const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJodWVhZWNuaWNvY2xoYmVtZGp5Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTc2NDc0NzAsImV4cCI6MjA3MzIyMzQ3MH0.BEGVkEaAb6xyyShn0tS4xmG4dGhbCVZatIrSR56lfCA";
 const DEVICE_ID = "rbpi-zero2w-1";
-
 const sb = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
-const $val = document.getElementById('val');
-const $dbg = document.getElementById('dbg');
+const $val = document.getElementById('val'), $dbg = document.getElementById('dbg'), $metric = document.getElementById('metric');
 
-// --- Chart
 const labels=[], data=[];
-const chart = new Chart(document.getElementById('chart'), {
-  type:'line',
-  data:{ labels, datasets:[{ label:'distance (cm)', data, tension:.25 }]},
-  options:{ animation:false, scales:{ y:{ beginAtZero:true } } }
+const chart = new Chart(document.getElementById('chart'), { type:'line',
+  data:{ labels, datasets:[{ label:'valor', data, tension:.25 }]},
+  options:{ animation:false, scales:{ y:{ beginAtZero:false } } }
 });
+function dbg(...a){ console.log(...a); $dbg.textContent = a.map(x=>typeof x==='string'?x:JSON.stringify(x)).join(' | '); }
 
-function dbg(...args){ console.log(...args); $dbg.textContent = (args.map(a=>typeof a==='string'?a:JSON.stringify(a)).join(' | ')); }
+let channel=null;
+async function loadMetric(metric){
+  const { data: init, error } = await sb.from('sensor_readings')
+    .select('ts,value,metric').eq('device_id', DEVICE_ID)
+    .eq('metric', metric).order('ts',{ascending:false}).limit(120);
+  labels.length=0; data.length=0;
+  (init??[]).reverse().forEach(r=>{ labels.push(new Date(r.ts).toLocaleTimeString()); data.push(Number(r.value)); });
+  chart.data.datasets[0].label = metric; chart.update();
+  if((init??[]).length) $val.textContent = Number(init[0].value).toFixed(2);
 
-// Carga inicial (últimos 60)
-try {
-  const { data: init, error } = await sb
-    .from('sensor_readings')
-    .select('ts,value,device_id')
-    .eq('device_id', DEVICE_ID)
-    .order('ts', { ascending:false })
-    .limit(60);
-
-  if (error) { dbg('SELECT error:', error); }
-  else {
-    (init ?? []).reverse().forEach(r=>{
-      labels.push(new Date(r.ts).toLocaleTimeString());
-      data.push(Number(r.value));
-    });
-    if ((init ?? []).length) {
-      $val.textContent = Number(init[0].value).toFixed(1);
-      chart.update();
-    } else {
-      dbg('No hay datos iniciales para', DEVICE_ID);
-    }
-  }
-} catch (e) { dbg('SELECT catch:', e); }
-
-// Realtime (INSERT)
-try {
-  const channel = sb.channel('readings')
-    .on('postgres_changes', { event:'INSERT', schema:'public', table:'sensor_readings', filter:`device_id=eq.${DEVICE_ID}` },
+  if(channel) channel.unsubscribe();
+  channel = sb.channel('metric-'+metric)
+    .on('postgres_changes',{event:'INSERT',schema:'public',table:'sensor_readings',
+      filter:`device_id=eq.${DEVICE_ID},metric=eq.${metric}`},
       payload=>{
-        const r = payload.new, v = Number(r.value);
-        labels.push(new Date(r.ts).toLocaleTimeString());
-        data.push(v);
-        if(labels.length>120){ labels.shift(); data.shift(); }
-        $val.textContent = v.toFixed(1);
-        chart.update();
+        const r=payload.new, v=Number(r.value);
+        labels.push(new Date(r.ts).toLocaleTimeString()); data.push(v);
+        if(labels.length>200){ labels.shift(); data.shift(); }
+        $val.textContent = isFinite(v)? v.toFixed(2) : '—'; chart.update();
       })
-    .subscribe(status => dbg('Realtime status:', status));
-} catch (e) { dbg('Realtime catch:', e); }
+    .subscribe(status=>dbg('Realtime:', status+' @ '+metric));
+}
+await loadMetric($metric.value);
+$metric.onchange = e => loadMetric(e.target.value);
 
-// Comandos LED con feedback
-document.getElementById('on').onclick  = async () => {
-  const { error } = await sb.from('commands').insert({ device_id: DEVICE_ID, command:'LED_ON' });
-  if (error) dbg('LED_ON error:', error);
+// OLED
+document.getElementById('sendMsg').onclick = async () => {
+  const text = (document.getElementById('msg').value||'').trim(); if(!text) return;
+  const { error } = await sb.from('commands').insert({ device_id: DEVICE_ID, command:'OLED_TEXT', payload:text });
+  if (error) dbg('OLED_TEXT error:', error);
 };
-document.getElementById('off').onclick = async () => {
-  const { error } = await sb.from('commands').insert({ device_id: DEVICE_ID, command:'LED_OFF' });
-  if (error) dbg('LED_OFF error:', error);
+document.getElementById('clearOled').onclick = async () => {
+  const { error } = await sb.from('commands').insert({ device_id: DEVICE_ID, command:'OLED_CLEAR' });
+  if (error) dbg('OLED_CLEAR error:', error);
 };
+
+// Tabs
+const tabSensors=document.getElementById('tabSensors'), tabOled=document.getElementById('tabOled');
+const panelSensors=document.getElementById('panelSensors'), panelOled=document.getElementById('panelOled');
+function showSensors(){ tabSensors.classList.add('active'); tabOled.classList.remove('active'); panelSensors.classList.remove('hidden'); panelOled.classList.add('hidden'); }
+function showOled(){ tabOled.classList.add('active'); tabSensors.classList.remove('active'); panelOled.classList.remove('hidden'); panelSensors.classList.add('hidden'); }
+tabSensors.onclick = showSensors; tabOled.onclick = showOled;
 </script>
 </body>
 </html>
