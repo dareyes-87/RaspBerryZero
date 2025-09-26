@@ -63,42 +63,79 @@ import { createClient } from "https://cdn.jsdelivr.net/npm/@supabase/supabase-js
 const SUPABASE_URL = "https://rhueaecnicoclhbemdjy.supabase.co";
 const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJodWVhZWNuaWNvY2xoYmVtZGp5Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTc2NDc0NzAsImV4cCI6MjA3MzIyMzQ3MH0.BEGVkEaAb6xyyShn0tS4xmG4dGhbCVZatIrSR56lfCA";
 const DEVICE_ID = "rbpi-zero2w-1";
+
 const sb = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
-const $val = document.getElementById('val'), $dbg = document.getElementById('dbg'), $metric = document.getElementById('metric');
+const $val = document.getElementById('val');
+const $dbg = document.getElementById('dbg');
+const $metric = document.getElementById('metric');
 
 const labels=[], data=[];
-const chart = new Chart(document.getElementById('chart'), { type:'line',
+const chart = new Chart(document.getElementById('chart'), {
+  type:'line',
   data:{ labels, datasets:[{ label:'valor', data, tension:.25 }]},
   options:{ animation:false, scales:{ y:{ beginAtZero:false } } }
 });
-function dbg(...a){ console.log(...a); $dbg.textContent = a.map(x=>typeof x==='string'?x:JSON.stringify(x)).join(' | '); }
+function dbg(...a){ console.log(...a); $dbg.textContent = a.map(x=>typeof x==='string'?a:JSON.stringify(a)).join(' | '); }
 
-let channel=null;
-async function loadMetric(metric){
+// ---- Estado de UI
+let currentMetric = $metric.value;
+let needsUpdate = false;
+setInterval(()=>{ if(needsUpdate){ chart.update(); needsUpdate=false; } }, 250);
+
+// Carga inicial para la métrica visible
+async function loadInitial(metric){
   const { data: init, error } = await sb.from('sensor_readings')
-    .select('ts,value,metric').eq('device_id', DEVICE_ID)
-    .eq('metric', metric).order('ts',{ascending:false}).limit(120);
-  labels.length=0; data.length=0;
-  (init??[]).reverse().forEach(r=>{ labels.push(new Date(r.ts).toLocaleTimeString()); data.push(Number(r.value)); });
-  chart.data.datasets[0].label = metric; chart.update();
-  if((init??[]).length) $val.textContent = Number(init[0].value).toFixed(2);
-
-  if(channel) channel.unsubscribe();
-  channel = sb.channel('metric-'+metric)
-    .on('postgres_changes',{event:'INSERT',schema:'public',table:'sensor_readings',
-      filter:`device_id=eq.${DEVICE_ID},metric=eq.${metric}`},
-      payload=>{
-        const r=payload.new, v=Number(r.value);
-        labels.push(new Date(r.ts).toLocaleTimeString()); data.push(v);
-        if(labels.length>200){ labels.shift(); data.shift(); }
-        $val.textContent = isFinite(v)? v.toFixed(2) : '—'; chart.update();
-      })
-    .subscribe(status=>dbg('Realtime:', status+' @ '+metric));
+    .select('ts,value,metric')
+    .eq('device_id', DEVICE_ID).eq('metric', metric)
+    .order('ts', { ascending:false }).limit(120);
+  labels.length = 0; data.length = 0;
+  (init ?? []).reverse().forEach(r=>{
+    labels.push(new Date(r.ts).toLocaleTimeString());
+    data.push(Number(r.value));
+  });
+  chart.data.datasets[0].label = metric;
+  needsUpdate = true;
+  if ((init ?? []).length) $val.textContent = Number(init[0].value).toFixed(2);
+  if (error) dbg('SELECT error:', error);
 }
-await loadMetric($metric.value);
-$metric.onchange = e => loadMetric(e.target.value);
+await loadInitial(currentMetric);
+$metric.onchange = async (e)=>{ currentMetric = e.target.value; await loadInitial(currentMetric); };
 
-// OLED
+// ---- Suscripción única a todas las métricas del device
+let channel;
+function subscribe(){
+  if (channel) channel.unsubscribe();
+
+  channel = sb.channel('readings-'+DEVICE_ID);
+  channel.on(
+    'postgres_changes',
+    { event:'INSERT', schema:'public', table:'sensor_readings', filter:`device_id=eq.${DEVICE_ID}` },
+    payload => {
+      const r = payload.new;
+      if (r.metric !== currentMetric) return;          // solo pinta si coincide la métrica visible
+      const v = Number(r.value);
+      labels.push(new Date(r.ts).toLocaleTimeString());
+      data.push(v);
+      if(labels.length>200){ labels.shift(); data.shift(); }
+      $val.textContent = isFinite(v) ? v.toFixed(2) : '—';
+      needsUpdate = true;
+    }
+  );
+  channel.subscribe((status) => {
+    dbg('Realtime:', status + ' (canal único)');
+    if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+      setTimeout(subscribe, 1000); // reintento simple
+    }
+  });
+}
+subscribe();
+
+// Re-suscribir al volver a la pestaña (por si el navegador “duerme” el socket)
+document.addEventListener('visibilitychange', ()=>{
+  if (document.visibilityState === 'visible') subscribe();
+});
+
+// ---- OLED
 document.getElementById('sendMsg').onclick = async () => {
   const text = (document.getElementById('msg').value||'').trim(); if(!text) return;
   const { error } = await sb.from('commands').insert({ device_id: DEVICE_ID, command:'OLED_TEXT', payload:text });
@@ -109,12 +146,13 @@ document.getElementById('clearOled').onclick = async () => {
   if (error) dbg('OLED_CLEAR error:', error);
 };
 
-// Tabs
+// ---- Tabs
 const tabSensors=document.getElementById('tabSensors'), tabOled=document.getElementById('tabOled');
 const panelSensors=document.getElementById('panelSensors'), panelOled=document.getElementById('panelOled');
 function showSensors(){ tabSensors.classList.add('active'); tabOled.classList.remove('active'); panelSensors.classList.remove('hidden'); panelOled.classList.add('hidden'); }
 function showOled(){ tabOled.classList.add('active'); tabSensors.classList.remove('active'); panelOled.classList.remove('hidden'); panelSensors.classList.add('hidden'); }
 tabSensors.onclick = showSensors; tabOled.onclick = showOled;
 </script>
+
 </body>
 </html>
